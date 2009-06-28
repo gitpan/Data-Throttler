@@ -4,11 +4,9 @@ package Data::Throttler;
 use strict;
 use warnings;
 use Log::Log4perl qw(:easy);
-use Text::ASCIITable;
-use DBM::Deep;
 
-our $VERSION    = "0.02";
-our $DB_VERSION = "1.0";
+our $VERSION    = "0.03";
+our $DB_VERSION = "1.1";
 
 ###########################################
 sub new {
@@ -16,42 +14,63 @@ sub new {
     my($class, %options) = @_;
 
     my $self = {
-        db_version => $DB_VERSION,
+        db_version      => $DB_VERSION,
+        backend         => "Memory",
+        backend_options => {},
+        reset           => 0,
+        %options,
     };
 
-    $self->{db_file} = $options{db_file} if defined $options{db_file};
-    $self->{lock}    = sub { };
-    $self->{unlock}  = sub { };
+    if($self->{db_file}) {
+        # legacy option, translate
+        $self->{backend_options} = {
+            db_file => $self->{db_file},
+        };
+        $self->{backend} = "YAML";
+    }
+
+    my $backend_class = "Data::Throttler::Backend::$self->{backend}";
+
+    $self->{db} = $backend_class->new( 
+            %{ $self->{backend_options} } );
+
     $self->{changed} = 0;
 
     bless $self, $class;
 
     my $create = 1;
 
-    if($self->{db_file}) {
-            # persistent store
-        if(-f $self->{db_file}) {
-            $create = 0;
-        }
-        $self->{db} = DBM::Deep->new(
-            file      => $self->{db_file},
-            autoflush => 1,
-            locking   => 1,
-        );
-        $self->{lock}   = sub { $self->{db}->lock() };
-        $self->{unlock} = sub { $self->{db}->unlock() };
+    if( $self->{ db }->exists() ) {
+        DEBUG "Backend store exists";
+        $self->lock();
+        $self->{data} = $self->{ db }->load();
 
-        if($self->{db}->{chain} and
-           ($self->{db}->{chain}->{max_items} != $options{max_items} or
-            $self->{db}->{chain}->{interval} != $options{interval})) {
-            $create = 0;
+        $create = 0;
+
+        if($self->{data}->{chain} and
+           ($self->{data}->{chain}->{max_items} != $options{max_items} or
+            $self->{data}->{chain}->{interval} != $options{interval})) {
             $self->{changed} = 1;
-            $self->{options} = \%options;
+            $create = 1;
         }
-    }
 
+        if($options{reset} or !$self->{ db }->backend_store_ok() ) {
+            $create = 1;
+        }
+        $self->unlock();
+    }
+    
     if($create) {
-        $self->create( \%options );
+        $self->{ db }->create( \%options ) or
+            LOGDIE "Creating backend store failed";
+
+          # create bucket chain
+        $self->create( {
+            max_items => $options{max_items},
+            interval  => $options{interval},
+        });
+
+        $self->{db}->save( $self->{data} );
     }
 
     return $self;
@@ -64,32 +83,36 @@ sub create {
 
     if( $self->{changed} ) {
         ERROR "Bucket chain parameters have changed ",
-              "(max_items: $self->{db}->{chain}->{max_items}/",
+              "(max_items: $self->{data}->{chain}->{max_items}/",
               "$options->{max_items} ",
-              "(interval: $self->{db}->{chain}->{interval}/",
+              "(interval: $self->{data}->{chain}->{interval}/",
               "$options->{interval})", ", throwing old chain away";
+        $self->{changed} = 0;
     }
 
-    $self->{lock}->();
-    $self->{db}->{chain} = Data::Throttler::BucketChain->new(
+    DEBUG "Creating bucket chain max_items=$options->{max_items} ",
+          "interval=$options->{interval}";
+
+    $self->{data}->{chain} = Data::Throttler::BucketChain->new(
             max_items => $options->{max_items},
             interval  => $options->{interval},
             );
-    $self->{unlock}->();
 }
 
 ###########################################
 sub lock {
 ###########################################
     my($self) = @_;
-    $self->{lock}->();
+    DEBUG "Lock on";
+    $self->{db}->lock();
 }
 
 ###########################################
 sub unlock {
 ###########################################
     my($self) = @_;
-    $self->{unlock}->();
+    DEBUG "Lock off";
+    $self->{db}->unlock();
 }
 
 ###########################################
@@ -97,13 +120,18 @@ sub try_push {
 ###########################################
     my($self, %options) = @_;
 
-    if($self->{changed}) {
-        $self->create( $self->{options} );
-        $self->{changed} = 0;
+    if(exists $options{key}) {
+        DEBUG "Pushing key $options{key}";
+    } else {
+        DEBUG "Pushing keyless item";
     }
 
     $self->lock();
-    my $ret = $self->{db}->{chain}->try_push(%options);
+
+    $self->{data} = $self->{db}->load();
+    my $ret = $self->{data}->{chain}->try_push(%options);
+    $self->{db}->save( $self->{data} );
+
     $self->unlock();
     return $ret;
 }
@@ -113,7 +141,8 @@ sub buckets_dump {
 ###########################################
     my($self) = @_;
     $self->lock();
-    my $ret = $self->{db}->{chain}->as_string();
+    $self->{data} = $self->{db}->load();
+    my $ret = $self->{data}->{chain}->as_string();
     $self->unlock();
     return $ret;
 }
@@ -122,7 +151,7 @@ sub buckets_dump {
 sub buckets_rotate {
 ###########################################
     my($self) = @_;
-    my $ret = $self->{db}->{chain}->rotate();
+    my $ret = $self->{data}->{chain}->rotate();
     return $ret;
 }
 
@@ -166,7 +195,6 @@ sub member {
 package Data::Throttler::BucketChain;
 ###########################################
 use Log::Log4perl qw(:easy);
-use Text::ASCIITable;
 
 ###########################################
 sub new {
@@ -263,6 +291,8 @@ sub next_bucket {
 sub as_string {
 ###########################################
     my($self) = @_;
+
+    require Text::ASCIITable;
 
     my $t = Text::ASCIITable->new();
     $t->setCols("#", "idx", ("Time: " . hms(time)), "Key", "Count");
@@ -429,12 +459,141 @@ sub try_push {
     } else {
         DEBUG "Increasing counter $key by $count ",
               "($val|$self->{max_items})";
-        $b->{count}->{$key} = $val + $count;
+        $b->{count}->{$key} += $count;
         return 1;
     }
 
     LOGDIE "Time $time is outside of bucket range\n", $self->as_string;
     return undef;
+}
+
+###########################################
+package Data::Throttler::Backend::Base;
+###########################################
+
+###########################################
+sub new {
+###########################################
+    my($class, %options) = @_;
+
+    my $self = { 
+        %options,
+    };
+
+    bless $self, $class;
+    $self->init();
+    return $self;
+}
+
+sub exists { 0 }
+sub create { 1 }
+#sub save   { }
+#sub load   { }
+sub init   { }
+sub lock   { }
+sub unlock { }
+sub backend_store_ok { 1 }
+
+###########################################
+package Data::Throttler::Backend::Memory;
+###########################################
+use base 'Data::Throttler::Backend::Base';
+
+###########################################
+sub save {
+###########################################
+    my($self, $data) = @_;
+    $self->{data} = $data;
+}
+
+###########################################
+sub load {
+###########################################
+    my($self) = @_;
+    return $self->{data};
+}
+
+###########################################
+package Data::Throttler::Backend::YAML;
+###########################################
+use base 'Data::Throttler::Backend::Base';
+use Log::Log4perl qw(:easy);
+use Fcntl qw(:flock);
+
+###########################################
+sub init {
+###########################################
+    my($self) = @_;
+
+    require YAML;
+}
+
+###########################################
+sub backend_store_ok {
+###########################################
+    my($self) = @_;
+
+    # Legacy instances used DBM::Deep, but those data stores will be 
+    # replaced by YAML backends. If we reuse a backend data store, make
+    # sure it's a YAML file and not a DBM::Deep blob.
+    if(! -f $self->{db_file} ) {
+        return 1;
+    }
+
+    eval {
+        $self->load();
+    };
+
+    if($@) {
+        ERROR "$self->{db_file} apparently isn't a YAML file, we'll ",
+              "have to dump it and rebuild the bucket chain in YAML";
+        return 0;
+    }
+
+    return 1;
+}
+
+###########################################
+sub exists {
+###########################################
+    my($self) = @_;
+
+    return -f $self->{db_file};
+}
+
+###########################################
+sub save {
+###########################################
+    my($self, $data) = @_;
+
+    DEBUG "Saving YAML file $self->{db_file}";
+    YAML::DumpFile( $self->{db_file}, $data );
+}
+
+###########################################
+sub load {
+###########################################
+    my($self) = @_;
+
+    DEBUG "Loading YAML file $self->{db_file}";
+    return YAML::LoadFile( $self->{db_file} );
+}
+
+###########################################
+sub lock {
+###########################################
+    my($self) = @_;
+
+    open $self->{fh}, "+<", $self->{db_file} or 
+        LOGDIE "Can't open $self->{db_file} for locking";
+    flock $self->{fh}, LOCK_EX;
+}
+
+###########################################
+sub unlock {
+###########################################
+    my($self) = @_;
+    flock $self->{fh}, LOCK_UN;
 }
 
 1;
@@ -467,7 +626,10 @@ Data::Throttler - Limit data throughput
     my $throttler = Data::Throttler->new(
         max_items => 100,
         interval  => 3600,
-        db_file   => "/tmp/mythrottle.dat",
+        backend   => "YAML",
+        backend_options => {
+            db_file => "/tmp/mythrottle.yml",
+        },
     );
 
     if($throttler->try_push(key => "somekey")) {
@@ -499,8 +661,17 @@ throttler, using a persistent database is required:
     my $throttler = Data::Throttler->new(
         max_items => 100,
         interval  => 3600,
-        db_file   => "/tmp/mythrottle.dat",
+        backend   => "YAML",
+        backend_options => {
+            db_file => "/tmp/mythrottle.yml",
+        },
     );
+
+The call above will reuse an existing backend store, given that the
+C<max_items> and C<interval> settings are compatible and leave the
+stored counter bucket chain contained therein intact. To specify that
+the backend store should be rebuilt and all counters be reset, use 
+the C<reset =E<gt> 1> option of the Data::Throttler object constructor.
 
 In the simplest case, C<Data::Throttler> just keeps track of single 
 events. It allows a certain number of events per time frame to succeed
@@ -603,7 +774,11 @@ time than I<now> when trying to push an item:
 
 Speaking of debugging, there's a utility method C<buckets_dump> which
 returns a string containing a formatted representation of what's in
-each bucket. So the code
+each bucket. It requires the CPAN module Text::ASCIITable, so make sure
+to have it installed before calling the method. The module is not 
+a requirement for Data::Throttler on purpose.
+
+So the code
 
     use Data::Throttler;
     
