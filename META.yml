@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Data-Throttler
-version:            0.03
+version:            0.04
 abstract:           Limit data throughput
 author:
     - Mike Schilli <cpan@perlmeister.com>
@@ -14,6 +14,8 @@ requires:
     Log::Log4perl:  1
     Set::IntSpan:   0
     YAML:           0.62
+resources:
+    repository:  http://github.com/mschilli/data-throttler-perl
 no_index:
     directory:
         - t
