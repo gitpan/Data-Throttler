@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Data-Throttler
-version:            0.04
+version:            0.05
 abstract:           Limit data throughput
 author:
     - Mike Schilli <cpan@perlmeister.com>
